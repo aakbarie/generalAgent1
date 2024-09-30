@@ -10,19 +10,28 @@ import streamlit as st
 from rank_bm25 import BM25Okapi
 from nltk.tokenize import word_tokenize
 
-# Updated imports for deprecated modules
-from langchain_community.chat_models import ChatOllama  # Updated import
-from langchain_community.document_loaders import PyPDFLoader  # Updated import
+# Updated imports from langchain_community
+from langchain_community.chat_models import ChatOllama
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.vectorstores import FAISS
 
-# Remaining imports from main langchain package
-from langchain.embeddings import OllamaEmbeddings
-from langchain.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
-# Ensure NLTK data is downloaded
 import nltk
-nltk.download('punkt')
+
+# Prevent repeated downloads of 'punkt'
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+
+# Attempt to import tiktoken for accurate token counting
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 
 # Streamlit page configuration
 st.set_page_config(page_title="Provider Manual Assistant", layout="wide")
@@ -59,7 +68,7 @@ st.markdown(
         background-color: #D3D9D4 !important; /* Light Gray */
         color: #212A31 !important; /* Dark Blue text */
         border: 2px solid #124E66 !important; /* Teal border */
-        border-radius: 5px; /* Optional: Add border radius for rounded corners */
+        border-radius: 5px; /* Rounded corners */
     }
     /* Header styling */
     h1, h2, h3, h4, h5, h6 {
@@ -79,6 +88,38 @@ st.markdown(
         font-size: 16px;
         color: #2E3944; /* Slate Gray */
     }
+
+    /* Targeting the dropdown in the sidebar */
+span[data-baseweb="select"] {
+    background-color: #D3D9D4 !important; /* Light gray background */
+    color: #212A31 !important; /* Dark text for contrast */
+    border: 1px solid #124E66; /* Teal border */
+    border-radius: 5px; /* Optional: Rounded corners */
+}
+
+/* When the dropdown is in its expanded (opened) state */
+ul[data-baseweb="menu"] {
+    background-color: #FFFFFF !important; /* White background for options */
+    color: #212A31 !important; /* Dark text for options */
+}
+
+/* Styling individual items in the dropdown */
+li[data-baseweb="menu-item"] {
+    background-color: #FFFFFF !important; /* White background */
+    color: #212A31 !important; /* Dark text */
+}
+
+/* When hovering over dropdown items */
+li[data-baseweb="menu-item"]:hover {
+    background-color: #D3D9D4 !important; /* Light gray background on hover */
+    color: #124E66 !important; /* Teal text on hover */
+}
+
+/* Tag styling for selected items */
+span[data-baseweb="tag"][role="button"] {
+    background-color: #2E3944 !important; /* Slate gray for selected item */
+    color: #FFFFFF !important; /* White text for selected item */
+}
     </style>
     """,
     unsafe_allow_html=True,
@@ -98,8 +139,11 @@ for directory in [SESSION_HISTORY_DIR, DOCUMENTS_DIR]:
 
 def clean_text(text):
     """Cleans the input text by removing extra whitespace."""
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    return re.sub(r'\s+', ' ', text).strip()
+
+def sanitize_filename(filename):
+    """Sanitizes the filename to prevent filesystem issues."""
+    return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
 def save_to_disk(obj, path):
     """Saves an object to disk using pickle."""
@@ -176,7 +220,40 @@ def setup_llm_model():
         st.error("Failed to initialize the LLM model.")
         return None
 
-def combined_retrieve_multi(query, documents_data):
+def count_tokens(text: str, model: str = "gpt-3.5-turbo") -> int:
+    """
+    Counts the number of tokens in a given text using tiktoken.
+
+    Args:
+        text (str): The text to tokenize.
+        model (str): The model name for encoding. Adjust if using a different model.
+
+    Returns:
+        int: The number of tokens.
+    """
+    if not tiktoken:
+        return approximate_token_count(text)
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoding = tiktoken.get_encoding("cl100k_base")  # Default encoding
+    tokens = encoding.encode(text)
+    return len(tokens)
+
+def approximate_token_count(text: str) -> int:
+    """
+    Approximates the number of tokens in a given text.
+
+    Args:
+        text (str): The text to tokenize.
+
+    Returns:
+        int: The approximate number of tokens.
+    """
+    # Approximation: 1 token ~= 0.75 words
+    return int(len(text.split()) / 0.75)
+
+def combined_retrieve_multi(query, documents_data, bm25_top_k=3, faiss_top_k=3):
     """Combines BM25 and FAISS retrieval results from multiple documents."""
     bm25_results = []
     faiss_results = []
@@ -189,11 +266,11 @@ def combined_retrieve_multi(query, documents_data):
         # BM25 retrieval
         tokenized_query = word_tokenize(query.lower())
         bm25_scores = bm25.get_scores(tokenized_query)
-        top_k_indices = bm25_scores.argsort()[-5:][::-1]
+        top_k_indices = bm25_scores.argsort()[-bm25_top_k:][::-1]
         bm25_results.extend([chunks[i] for i in top_k_indices])
 
         # FAISS similarity search
-        faiss_results.extend(db.similarity_search(query, k=5))
+        faiss_results.extend(db.similarity_search(query, k=faiss_top_k))
 
     # Combine results, avoiding duplicates
     seen = set()
@@ -204,8 +281,20 @@ def combined_retrieve_multi(query, documents_data):
             seen.add(doc.page_content)
     return combined_results
 
-def chain_invoke_multi(question, llm, documents_data, conversation_history):
-    """Generates an answer using the LLM, including context and conversation history, from multiple documents."""
+def chain_invoke_multi(question, llm, documents_data, conversation_history, max_tokens=2048):
+    """
+    Generates an answer using the LLM, including context and conversation history, from multiple documents.
+
+    Args:
+        question (str): The user's question.
+        llm: The language model instance.
+        documents_data (dict): Data of selected documents.
+        conversation_history (list): List of past interactions.
+        max_tokens (int): Maximum allowed tokens.
+
+    Returns:
+        tuple: (response_text, context_docs)
+    """
     context_docs = combined_retrieve_multi(question, documents_data)
     context = "\n".join([doc.page_content for doc in context_docs])
 
@@ -214,7 +303,7 @@ def chain_invoke_multi(question, llm, documents_data, conversation_history):
     for turn in reversed(conversation_history[-10:]):  # Limit to last 10 interactions
         conversation += f"User: {turn['question']}\nAssistant: {turn['response']}\n"
 
-    # Update the prompt to include conversation history
+    # Construct initial prompt
     prompt = f"""
 You are an assistant helping answer questions based on the provided context.
 
@@ -232,11 +321,122 @@ Answer the question based ONLY on the provided context and conversation history.
 If you don't know the answer, just say that you don't know; don't try to make up an answer.
 """
 
-    # Debugging outputs (optional - remove or comment out in production)
-    # st.write("=== Conversation History ===")
-    # st.write(conversation_history)
-    # st.write("=== Constructed Prompt ===")
-    # st.write(prompt)
+    # Count tokens
+    token_count = count_tokens(prompt)
+
+    # Check if token count exceeds the limit
+    if token_count > max_tokens:
+        excess_tokens = token_count - max_tokens
+
+        # Strategy:
+        # 1. Trim conversation history first
+        # 2. If still exceeding, trim context
+
+        # 1. Trim conversation history
+        while excess_tokens > 0 and len(conversation_history) > 0:
+            # Remove the oldest turn
+            conversation_history.pop(0)
+            # Rebuild conversation
+            conversation = ""
+            for turn in reversed(conversation_history[-10:]):
+                conversation += f"User: {turn['question']}\nAssistant: {turn['response']}\n"
+            # Reconstruct prompt
+            prompt = f"""
+You are an assistant helping answer questions based on the provided context.
+
+Context:
+{context}
+
+Conversation history:
+{conversation}
+
+Current question: {question}
+
+If the user refers to previous responses or seeks corrections, use the conversation history to provide accurate and context-aware answers.
+
+Answer the question based ONLY on the provided context and conversation history.
+If you don't know the answer, just say that you don't know; don't try to make up an answer.
+"""
+            # Re-count tokens
+            token_count = count_tokens(prompt)
+            excess_tokens = token_count - max_tokens
+
+        # 2. Trim context
+        if token_count > max_tokens:
+            # Calculate how much to trim context
+            # Allow some buffer for the prompt structure
+            buffer_tokens = 100
+            conversation_tokens = count_tokens(f"""
+You are an assistant helping answer questions based on the provided context.
+
+Conversation history:
+{conversation}
+
+Current question: {question}
+
+If the user refers to previous responses or seeks corrections, use the conversation history to provide accurate and context-aware answers.
+
+Answer the question based ONLY on the provided context and conversation history.
+If you don't know the answer, just say that you don't know; don't try to make up an answer.
+""") if tiktoken else approximate_token_count(f"""
+You are an assistant helping answer questions based on the provided context.
+
+Conversation history:
+{conversation}
+
+Current question: {question}
+
+If the user refers to previous responses or seeks corrections, use the conversation history to provide accurate and context-aware answers.
+
+Answer the question based ONLY on the provided context and conversation history.
+If you don't know the answer, just say that you don't know; don't try to make up an answer.
+""")
+
+            allowed_context_tokens = max_tokens - buffer_tokens - conversation_tokens
+
+            # Estimate tokens per chunk
+            if tiktoken:
+                tokens_per_chunk = [count_tokens(doc.page_content) for doc in context_docs]
+            else:
+                tokens_per_chunk = [approximate_token_count(doc.page_content) for doc in context_docs]
+
+            # Select chunks that fit within allowed_context_tokens
+            trimmed_context = []
+            current_tokens = 0
+            for doc, tokens in zip(context_docs, tokens_per_chunk):
+                if current_tokens + tokens > allowed_context_tokens:
+                    break
+                trimmed_context.append(doc.page_content)
+                current_tokens += tokens
+
+            # Reconstruct context
+            context = "\n".join(trimmed_context)
+
+            # Reconstruct prompt
+            prompt = f"""
+You are an assistant helping answer questions based on the provided context.
+
+Context:
+{context}
+
+Conversation history:
+{conversation}
+
+Current question: {question}
+
+If the user refers to previous responses or seeks corrections, use the conversation history to provide accurate and context-aware answers.
+
+Answer the question based ONLY on the provided context and conversation history.
+If you don't know the answer, just say that you don't know; don't try to make up an answer.
+"""
+
+            # Re-count tokens
+            token_count = count_tokens(prompt)
+
+            # If still exceeding, consider further trimming or notify the user
+            if token_count > max_tokens:
+                st.warning("Your request is too long and cannot be processed. Please simplify your question or reduce the number of selected documents.")
+                return "", context_docs
 
     try:
         response = llm.invoke(prompt)
@@ -248,11 +448,12 @@ If you don't know the answer, just say that you don't know; don't try to make up
 
 def save_session(conversation_history, session_name, doc_key):
     """Saves the conversation history to a file."""
-    filename = os.path.join(SESSION_HISTORY_DIR, f"{session_name}_{doc_key}.pkl")
+    sanitized_session_name = sanitize_filename(session_name.strip())
+    filename = os.path.join(SESSION_HISTORY_DIR, f"{sanitized_session_name}_{doc_key}.pkl")
     try:
         with open(filename, "wb") as f:
             pickle.dump(conversation_history, f)
-        st.success(f"Session '{session_name}' for documents '{doc_key}' saved successfully.")
+        st.success(f"Session '{sanitized_session_name}' for documents '{doc_key}' saved successfully.")
     except Exception as e:
         logging.error(f"Error saving session: {e}")
         st.error("Failed to save the session.")
@@ -281,10 +482,18 @@ def load_session(session_name):
         st.error("Failed to load the session.")
         return []
 
+def is_valid_pdf(file) -> bool:
+    """Validates if the uploaded file is a PDF and within size limits."""
+    return file.type == "application/pdf" and file.size < 10 * 1024 * 1024  # 10 MB limit
+
 def process_uploaded_pdfs(uploaded_files):
     """Processes uploaded PDF files and sets up the retrieval system for each."""
     for uploaded_file in uploaded_files:
-        doc_id = os.path.splitext(uploaded_file.name)[0]
+        if not is_valid_pdf(uploaded_file):
+            st.sidebar.error(f"Invalid file: {uploaded_file.name}. Ensure it's a PDF and less than 10MB.")
+            continue
+
+        doc_id = os.path.splitext(sanitize_filename(uploaded_file.name))[0]
         if doc_id not in st.session_state['documents']:
             doc_dir = os.path.join(DOCUMENTS_DIR, doc_id)
             if not os.path.exists(doc_dir):
@@ -417,8 +626,10 @@ def main():
                     doc_key = '_'.join(session_parts[1:])
                     missing_docs = [doc_id for doc_id in doc_key.split('_') if doc_id not in st.session_state['documents']]
                     if not missing_docs:
-                        st.session_state['conversation_histories'][doc_key] = load_session(selected_session)
-                        st.sidebar.success(f"Session '{session_name}' for documents '{doc_key}' loaded.")
+                        loaded_history = load_session(selected_session)
+                        if loaded_history:
+                            st.session_state['conversation_histories'][doc_key] = loaded_history
+                            st.sidebar.success(f"Session '{session_name}' for documents '{doc_key}' loaded.")
                     else:
                         st.sidebar.error(f"The following documents associated with this session are not uploaded: {', '.join(missing_docs)}.")
                 else:
@@ -441,17 +652,31 @@ def main():
 
         # 4. Question Input with Header
         st.header("Enter Your Question")
-        question = st.text_input("hit enter", key="question", label_visibility="hidden")
+        question = st.text_input("Question", key="question", label_visibility="hidden")
 
         if st.button("🔍 Search Documents"):
             if question:
                 # Enhanced loading screen with dynamic messages lasting 5 seconds each
                 loading_messages = [
-                    "Analyzing documents...",
-                    "Gathering information...",
-                    "Searching across multiple files...",
-                    "Compiling responses...",
-                    "Almost there..."
+                    # Einstein quotes
+    "Imagination is more important than knowledge. – Albert Einstein",
+    "Life is like riding a bicycle. To keep your balance, you must keep moving. – Albert Einstein",
+    "The important thing is not to stop questioning. Curiosity has its own reason for existence. – Albert Einstein",
+    
+    # Alan Turing quotes
+    "We can only see a short distance ahead, but we can see plenty there that needs to be done. – Alan Turing",
+    "Machines take me by surprise with great frequency. – Alan Turing",
+    "Sometimes it is the people no one can imagine anything of who do the things no one can imagine. – Alan Turing",
+    
+    # Goethe quotes
+    "Knowing is not enough; we must apply. Willing is not enough; we must do. – Johann Wolfgang von Goethe",
+    "Whatever you can do or dream you can, begin it. Boldness has genius, power, and magic in it. – Johann Wolfgang von Goethe",
+    "Doubt can only be removed by action. – Johann Wolfgang von Goethe",
+    
+    # Richard Feynman quotes
+    "I would rather have questions that can't be answered than answers that can't be questioned. – Richard Feynman",
+    "The first principle is that you must not fool yourself and you are the easiest person to fool. – Richard Feynman",
+    "What I cannot create, I do not understand. – Richard Feynman",
                 ]
                 loading_placeholder = st.empty()
                 for msg in loading_messages:
@@ -461,7 +686,8 @@ def main():
                     response, context_docs = chain_invoke_multi(
                         question, llm,
                         selected_documents_data,
-                        conversation_history
+                        conversation_history,
+                        max_tokens=2048
                     )
                     loading_placeholder.empty()  # Remove the loading message
                     st.markdown(f"### 📝 Answer")
@@ -486,7 +712,7 @@ def main():
 
         # 6. Save Session
         st.markdown("---")
-        session_name = st.text_input("💾 Enter a name to save this session:")
+        session_name = st.text_input("💾 Enter a name to save this session:", key="session_name")
         if st.button("💾 Save Session"):
             if session_name.strip():
                 save_session(conversation_history, session_name.strip(), doc_key)
