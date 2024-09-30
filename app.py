@@ -89,10 +89,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # Persistent storage paths
 SESSION_HISTORY_DIR = "saved_sessions"
+DOCUMENTS_DIR = "documents"
 
-# Ensure the directory for saved sessions exists
-if not os.path.exists(SESSION_HISTORY_DIR):
-    os.makedirs(SESSION_HISTORY_DIR)
+# Ensure the directories for saved sessions and documents exist
+for directory in [SESSION_HISTORY_DIR, DOCUMENTS_DIR]:
+    if not os.path.exists(directory):
+        os.makedirs(directory)
 
 def clean_text(text):
     """Cleans the input text by removing extra whitespace."""
@@ -125,7 +127,7 @@ def vector_db_exists(VECTOR_DB_PATH, BM25_PATH, CHUNKS_PATH) -> bool:
 
 def setup_retrieval_system(documents: List[Document], doc_id: str):
     """Sets up the retrieval system for the given document ID."""
-    doc_dir = os.path.join("documents", doc_id)
+    doc_dir = os.path.join(DOCUMENTS_DIR, doc_id)
     if not os.path.exists(doc_dir):
         os.makedirs(doc_dir)
 
@@ -209,7 +211,7 @@ def chain_invoke_multi(question, llm, documents_data, conversation_history):
 
     # Build the conversation history in reverse order (most recent first)
     conversation = ""
-    for turn in reversed(conversation_history):
+    for turn in reversed(conversation_history[-10:]):  # Limit to last 10 interactions
         conversation += f"User: {turn['question']}\nAssistant: {turn['response']}\n"
 
     # Update the prompt to include conversation history
@@ -224,9 +226,17 @@ Conversation history:
 
 Current question: {question}
 
+If the user refers to previous responses or seeks corrections, use the conversation history to provide accurate and context-aware answers.
+
 Answer the question based ONLY on the provided context and conversation history.
 If you don't know the answer, just say that you don't know; don't try to make up an answer.
 """
+
+    # Debugging outputs (optional - remove or comment out in production)
+    # st.write("=== Conversation History ===")
+    # st.write(conversation_history)
+    # st.write("=== Constructed Prompt ===")
+    # st.write(prompt)
 
     try:
         response = llm.invoke(prompt)
@@ -276,7 +286,7 @@ def process_uploaded_pdfs(uploaded_files):
     for uploaded_file in uploaded_files:
         doc_id = os.path.splitext(uploaded_file.name)[0]
         if doc_id not in st.session_state['documents']:
-            doc_dir = os.path.join("documents", doc_id)
+            doc_dir = os.path.join(DOCUMENTS_DIR, doc_id)
             if not os.path.exists(doc_dir):
                 os.makedirs(doc_dir)
             # Paths for storing data
@@ -311,6 +321,44 @@ def process_uploaded_pdfs(uploaded_files):
         else:
             st.sidebar.info(f"Document '{uploaded_file.name}' already processed.")
 
+def load_existing_documents():
+    """Loads existing documents from the documents directory into session state."""
+    for doc_id in os.listdir(DOCUMENTS_DIR):
+        doc_dir = os.path.join(DOCUMENTS_DIR, doc_id)
+        if os.path.isdir(doc_dir) and doc_id not in st.session_state['documents']:
+            VECTOR_DB_PATH = os.path.join(doc_dir, "vector_db.pkl")
+            BM25_PATH = os.path.join(doc_dir, "bm25.pkl")
+            CHUNKS_PATH = os.path.join(doc_dir, "chunks.pkl")
+            PDF_PATH = None
+
+            # Find the PDF file in the directory
+            for file in os.listdir(doc_dir):
+                if file.endswith(".pdf"):
+                    PDF_PATH = os.path.join(doc_dir, file)
+                    break
+
+            if not PDF_PATH:
+                logging.warning(f"No PDF found in {doc_dir}. Skipping.")
+                continue
+
+            # Load retrieval data
+            chunks = load_from_disk(CHUNKS_PATH)
+            bm25 = load_from_disk(BM25_PATH)
+            db = load_from_disk(VECTOR_DB_PATH)
+
+            if chunks is None or bm25 is None or db is None:
+                logging.warning(f"Incomplete retrieval data for '{doc_id}'. Skipping.")
+                continue
+
+            # Store the retrieval components per document
+            st.session_state['documents'][doc_id] = {
+                'chunks': chunks,
+                'bm25': bm25,
+                'db': db,
+                'pdf_path': PDF_PATH
+            }
+            logging.info(f"Loaded existing document '{doc_id}' into session state.")
+
 def get_conversation_history(selected_doc_ids):
     """Retrieves or initializes the conversation history for the selected documents."""
     doc_key = "_".join(sorted(selected_doc_ids))
@@ -328,6 +376,9 @@ def main():
         st.session_state['question_input'] = ''
     if "context_docs" not in st.session_state:
         st.session_state["context_docs"] = []
+
+    # Load existing documents from the documents directory
+    load_existing_documents()
 
     # Sidebar: File Uploader, Document Selection, and Saved Sessions
     with st.sidebar:
@@ -388,12 +439,13 @@ def main():
         # Collect the document data for the selected documents
         selected_documents_data = {doc_id: st.session_state['documents'][doc_id] for doc_id in selected_doc_ids}
 
-        # 4. Question Input
-        question = st.text_input("❓ Enter your question:")
+        # 4. Question Input with Header
+        st.header("Enter Your Question")
+        question = st.text_input("hit enter", key="question", label_visibility="hidden")
 
         if st.button("🔍 Search Documents"):
             if question:
-                # Loading screen
+                # Enhanced loading screen with dynamic messages lasting 5 seconds each
                 loading_messages = [
                     "Analyzing documents...",
                     "Gathering information...",
@@ -404,14 +456,14 @@ def main():
                 loading_placeholder = st.empty()
                 for msg in loading_messages:
                     loading_placeholder.markdown(f"### {msg}")
-                    time.sleep(0.5)
+                    time.sleep(5)  # Display each message for 5 seconds
                 with st.spinner("Generating answer..."):
                     response, context_docs = chain_invoke_multi(
                         question, llm,
                         selected_documents_data,
                         conversation_history
                     )
-                    loading_placeholder.empty()
+                    loading_placeholder.empty()  # Remove the loading message
                     st.markdown(f"### 📝 Answer")
                     st.write(response)
 
